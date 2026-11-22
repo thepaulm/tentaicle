@@ -4,7 +4,7 @@
 
 Build a personal remote-terminal application for Linux and macOS. Users authenticate with Google, enroll machines, list available machines and sessions, and connect through encrypted WebRTC data channels.
 
-Use Go and [Pion WebRTC](https://github.com/pion/webrtc). A trusted coordinator provides identity, machine discovery, authorization, and signaling. Terminal traffic travels directly between peers when possible, with the existing AWS TURN server providing relay fallback.
+Use Go and [Pion WebRTC](https://github.com/pion/webrtc). A trusted coordinator provides identity, machine discovery, authorization, and signaling. Any explicitly allowed user who completes Google sign-in may reach their enrolled machines; no per-device pairing or access to the remote host is required. Terminal traffic travels directly between peers when possible, with the existing AWS TURN server providing relay fallback.
 
 Sessions run under the agent’s OS account and survive network disconnects. They do not survive agent restarts or machine reboots. No tmux dependency.
 
@@ -25,11 +25,11 @@ Provide these commands:
 | `tentaicle machines` | List owned machines, availability, and last-seen time |
 | `tentaicle connect [machine]` | Select a machine and existing session, or create a session |
 | `tentaicle sessions <machine>` | List that machine’s sessions |
-| `tentaicle attach <machine> <session>` | Attach directly to an existing session |
+| `tentaicle attach <machine> <session> [--takeover]` | Attach directly to an existing session, optionally displacing the attached client |
 | `tentaicle terminate <machine> <session>` | Explicitly terminate a remote session |
 | `tentaicle agent enroll --name <name>` | Approve enrollment through a browser and register this OS account |
 | `tentaicle agent run` | Run the foreground agent |
-| `tentaicle agent install/uninstall` | Install or remove the user service |
+| `tentaicle agent start` / `stop` / `status` | Start the agent in the background, stop it, or report its state |
 | `tentaicle machine revoke <machine>` | Disable the machine’s credential and remote access |
 | `tentaicle devices` / `device revoke <id>` | List and revoke CLI credentials |
 | `tentaicle doctor` | Diagnose coordinator, authentication, and ICE connectivity |
@@ -66,17 +66,19 @@ Issue short-lived access tokens and rotating opaque refresh credentials. Store r
 
 Each agent belongs to one user and one local OS account. Agents can publish their own state and accept authorized connections; they cannot enumerate or control other machines.
 
-For every connection, issue a signed, single-use grant bound to the user, CLI device, target agent, connection ID, requested action, and expiry. The agent verifies it before exposing terminal operations.
+For every connection, issue a signed, single-use grant bound to the user, CLI device, target agent, connection ID, the CLI’s DTLS certificate fingerprint, requested action, and expiry. The agent verifies it, allowing 60 seconds of clock skew, and checks that the fingerprint matches the connected peer’s DTLS certificate before exposing terminal operations. A grant therefore cannot be reused on another connection.
 
-Trust the coordinator as the authorization authority. WebRTC encryption and authenticated signaling protect connections; independent peer-key pinning is outside v1.
+Trust the coordinator as the authorization authority: access depends on Google sign-in by an allowed user and a valid coordinator credential. WebRTC encryption and authenticated signaling protect connections. A compromised coordinator could grant itself access; independent peer-key pinning is outside v1.
 
 Push revocation to connected agents immediately. Renew active connection authorization every 30 seconds with a 90-second lease. If renewal fails, detach remote clients at lease expiry while retaining local shells. Revoking an enrolled agent also prevents further enrollment-credential use.
 
 ### Transport
 
-Use Pion’s reliable, ordered WebRTC data channels with ICE and authenticated coordinator signaling.
+Use Pion’s reliable, ordered WebRTC data channels with ICE and authenticated coordinator signaling. Mandatory DTLS encrypts every channel end to end, including through TURN; add no second encryption layer. Use only pure-Go cryptography (no OpenSSL or cgo).
 
-Define one versioned application channel carrying bounded frames for:
+The CLI sends its grant as the first frame; the agent accepts no other frames until the grant verifies.
+
+Define one versioned application channel carrying bounded frames, each tagged with a stream type so later features (such as file transfer) need no protocol version change. Frames cover:
 
 - Session creation and attachment.
 - Terminal input and sequenced output.
@@ -93,7 +95,7 @@ Support configurable STUN/TURN URLs and either static TURN credentials or shared
 
 Create each session with a PTY, the account’s configured login shell, and its home directory as the starting directory. No agent-managed account switching or root execution. Users may invoke ordinary `sudo` inside the shell.
 
-Support multiple sessions per machine, with a default limit of eight. Allow one attached client per session; reject additional attachments with a clear “already attached” response.
+Support multiple sessions per machine, with a default limit of eight. Allow one attached client per session; reject additional attachments with a clear “already attached” response that offers takeover. With `--takeover` (or confirmation in interactive `connect`), an authorized client of the same user displaces the attached client, which is told it was taken over and detached. Takeover lets a user recover a session held by a dead client without waiting for its reconnect window.
 
 Place the local terminal into raw mode while attached and always restore its state on exit or failure. Propagate window sizes and resize events. Deliver Ctrl-C through the PTY. Reserve `Ctrl-]` followed by `d` for detach, with an escaping mechanism for literal input.
 
@@ -105,12 +107,19 @@ Maintain a 1 MiB in-memory output ring per session with monotonic byte offsets:
 - A reconnecting client requests output after its last received offset.
 - A new attachment receives the retained output.
 - Report truncation visibly when older output has been discarded.
-- Never resend uncertain terminal input after reconnecting; tell the user input may need to be re-entered.
+- Input frames carry per-attachment sequence numbers; the agent acknowledges the last sequence written to the PTY. On reconnect, the agent reports its last applied sequence and the client resends only later frames, so input is neither duplicated nor lost. Bound unacknowledged input to 64 KiB and stop reading local input, other than the detach escape, while reconnecting.
+- When replaying retained output, the client strips sequences that make the local terminal reply or act, such as status and cursor-position reports, device-attribute queries, color and setting queries, window reports, and OSC 52 clipboard writes. The filter handles sequences split across chunks. Live output is not filtered.
 - Full-screen applications may require a redraw; exact screen reconstruction is outside v1.
 
 Session termination sends a graceful termination signal, then force-kills remaining session processes after five seconds. Agent shutdown terminates its sessions and reaps children. Retain exited-session metadata and buffered output for ten minutes so reconnecting clients can observe exit status.
 
-Install user services using systemd on Linux and a LaunchAgent on macOS. Document Linux lingering as an optional operator setup for operation without login. macOS support initially assumes the user is logged in; logout survival is not promised.
+Run the agent as a background process, as tmux does; install no systemd units, LaunchAgents, or system services. The user logs in once and runs `tentaicle agent start`, which re-executes the binary in a new session (`setsid`) with no controlling terminal and standard streams redirected, so it survives SSH disconnect and logout. Go cannot safely `fork` without `exec`, so use re-execution rather than a classic double fork.
+
+- Hold an exclusive lock and PID file in the user’s runtime or state directory so only one agent runs per account; `agent stop` and `agent status` use it.
+- Write logs to a size-bounded, rotated file in the state directory with owner-only permissions.
+- The agent does not restart after a crash and does not start at boot; the user logs in and runs `agent start` again. Previous sessions are gone, as with any agent restart.
+- On Linux, logout survival requires logind’s `KillUserProcesses=no`, the default on most distributions. `agent start` and `tentaicle doctor` read the setting from logind and warn when it is enabled.
+- On macOS, the agent survives SSH disconnect; survival of GUI logout is not promised.
 
 Build and test Linux and macOS binaries for amd64 and arm64. Provide release archives, checksums, and installation instructions.
 
@@ -144,14 +153,14 @@ Document initial Google OAuth setup, allowed Google user IDs, DNS, secret provis
 1. **Transport proof:** Establish Go-to-Go data channels with local signaling; verify direct and forced TURN connections using the existing server.
 2. **Identity and coordination:** Implement Google approval, device credentials, enrollment, discovery, signaling, and authorization grants.
 3. **Interactive terminal:** Add PTYs, session selection, input/output, resize, detach, and exit handling.
-4. **Recovery and access control:** Add bounded replay, reconnect, backpressure, revocation leases, and process cleanup.
-5. **Distribution and AWS:** Add platform services, release builds, Terraform, HTTPS, backups, diagnostics, and operator documentation.
+4. **Recovery and access control:** Add bounded replay with query filtering, reconnect with input sequencing, takeover, backpressure, revocation leases, and process cleanup.
+5. **Distribution and AWS:** Add background agent mode, release builds, Terraform, HTTPS, backups, diagnostics, and operator documentation.
 
 Each milestone includes its relevant automated tests. Complete the TURN proof before building features that depend on deployment connectivity.
 
 ## Validation and acceptance
 
-Use unit tests for authorization, credential rotation, approval expiry, protocol bounds, replay offsets, and session ownership. Use integration tests with a fake identity provider, a real coordinator, two Pion peers, and a local TURN server.
+Use unit tests for authorization, credential rotation, approval expiry, protocol bounds, replay offsets, replay filtering, input sequencing, DTLS fingerprint binding, and session ownership. Use integration tests with a fake identity provider, a real coordinator, two Pion peers, and a local TURN server.
 
 Acceptance requires:
 
@@ -159,13 +168,17 @@ Acceptance requires:
 - Owned machines listed correctly; other users cannot discover or access them.
 - Interactive shells work on Linux and macOS, including Unicode, Ctrl-C, resizing, and terminal-state restoration.
 - Direct and forced-relay connections both pass against the deployment’s TURN server.
-- Disconnect and reattach preserve a running shell without duplicating input.
+- Disconnect and reattach preserve a running shell without duplicating or losing input.
+- Replayed output containing terminal queries produces no input to the remote shell.
 - Output overflow, slow clients, and continuous detached output keep memory bounded.
-- Concurrent attachment is rejected consistently.
+- Concurrent attachment is rejected consistently; takeover detaches the previous client.
 - Expired, replayed, revoked, wrong-agent, and wrong-user grants are rejected.
+- A grant presented on a connection whose DTLS fingerprint does not match is rejected.
+- A Google account not on the allow-list cannot log in, enroll, or connect.
 - Credential revocation disconnects active clients within 90 seconds even if a push is lost.
+- The agent survives SSH disconnect and logout on Linux with `KillUserProcesses=no`, and on macOS after SSH disconnect.
 - Coordinator restart preserves enrollment; agent restart clearly invalidates previous sessions.
 - Backup restoration recovers users, enrollment, and credentials.
 - A clean AWS deployment can be reproduced from Terraform and documented setup inputs.
 
-Defer file transfer, remote-command automation, team sharing, Windows, browser terminals, independent peer authentication, exact terminal screen restoration, and high availability until after this release.
+Defer file transfer, remote-command automation, team sharing, Windows, browser terminals, independent peer authentication, service-manager integration (systemd user units with lingering, LaunchAgents) for crash restart and boot start, support for networks that allow only web ports (TURN over TLS on 443), exact terminal screen restoration, and high availability until after this release.
