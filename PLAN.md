@@ -30,7 +30,7 @@ Provide these commands:
 | `tentaicle local new [--name <name>]` | Create a session on this machine’s agent and attach to it |
 | `tentaicle local sessions` | List this machine’s agent sessions |
 | `tentaicle local attach <session> [--takeover]` | Attach to a session on this machine’s agent |
-| `tentaicle agent enroll --name <name>` | Approve enrollment through a browser and register this OS account |
+| `tentaicle agent enroll --name <name> [--replace]` | Approve enrollment through a browser and register this OS account; `--replace` supersedes an existing machine of that name |
 | `tentaicle agent run` | Run the foreground agent |
 | `tentaicle agent start [--inhibit-sleep]` / `stop` / `status` | Start the agent in the background, stop it, or report its state |
 | `tentaicle machine revoke <machine>` | Disable the machine’s credential and remote access |
@@ -69,13 +69,15 @@ CLI devices receive short-lived access tokens and rotating opaque refresh creden
 
 Agents do not use refresh credentials. At enrollment, the agent generates an Ed25519 key pair, keeps the private key in its state directory with owner-only permissions, and registers the public key. The agent authenticates each WebSocket connection and access-token request by signing a coordinator-issued nonce. Agent credentials do not expire from inactivity; they end only by revocation. This keeps an unattended agent from stranding itself through a failed rotation.
 
-Each agent belongs to one user and one local OS account. Agents can publish their own state and accept authorized connections; they cannot enumerate or control other machines.
+Each agent belongs to one user and one local OS account. Machine names are unique per user. Enrolling with an existing name fails unless `--replace` is given, which revokes the previous agent’s key once the new enrollment is approved; the approval page states that an existing machine will be replaced. Agents can publish their own state and accept authorized connections; they cannot enumerate or control other machines.
 
 For every connection, issue a signed, single-use grant bound to the user, CLI device, target agent, connection ID, the CLI’s DTLS certificate fingerprint, requested action, and expiry. The agent verifies it, allowing 60 seconds of clock skew, and checks that the fingerprint matches the connected peer’s DTLS certificate before exposing terminal operations. A grant therefore cannot be reused on another connection.
 
+The coordinator signs grants and leases with an Ed25519 key held in AWS Secrets Manager, separate from TLS. It publishes a current and a next public key with key IDs; signatures carry the key ID. Agents fetch the key set over HTTPS at enrollment and refresh it on each authenticated WebSocket connection, so keys rotate without re-enrollment.
+
 Trust the coordinator as the authorization authority: access depends on Google sign-in by an allowed user and a valid coordinator credential. WebRTC encryption and authenticated signaling protect connections. A compromised coordinator could grant itself access; independent peer-key pinning is outside v1.
 
-Push revocation to connected agents immediately. Renew active connection authorization every 30 seconds with a 90-second lease. If renewal fails, detach remote clients at lease expiry while retaining local shells. Revoking an enrolled agent disables its registered key.
+Push revocation to connected agents immediately. Renew active connection authorization every 30 seconds with a 90-second lease: the CLI requests a signed lease bound to the connection ID and CLI device from the coordinator and sends it over the data channel, and the agent verifies it. Renewal therefore does not depend on the agent’s own coordinator connection. The coordinator refuses renewal after revocation. If renewal fails, detach remote clients at lease expiry while retaining local shells. Revoking an enrolled agent disables its registered key.
 
 ### Transport
 
@@ -185,7 +187,7 @@ Each milestone includes its relevant automated tests. Complete the TURN proof be
 
 ## Validation and acceptance
 
-Use unit tests for authorization, credential rotation, approval expiry, protocol bounds, replay offsets, replay filtering, input sequencing, DTLS fingerprint binding, local socket peer-UID checks, agent key authentication, the refresh grace window, session environment construction, and session ownership. Use integration tests with a fake identity provider, a real coordinator, two Pion peers, and a local TURN server.
+Use unit tests for authorization, credential rotation, approval expiry, protocol bounds, replay offsets, replay filtering, input sequencing, DTLS fingerprint binding, local socket peer-UID checks, agent key authentication, grant and lease signing-key rotation, the refresh grace window, session environment construction, and session ownership. Use integration tests with a fake identity provider, a real coordinator, two Pion peers, and a local TURN server.
 
 Acceptance requires:
 
@@ -201,6 +203,8 @@ Acceptance requires:
 - Another local user cannot connect to the agent’s socket.
 - With sleep inhibition enabled, the machine does not idle-sleep while the agent runs on Linux and macOS, the screen still locks on its idle timer, and inhibition ends when the agent stops.
 - A lost refresh response does not revoke a CLI device; an agent stays enrolled across coordinator and network outages of any length.
+- Enrolling an existing machine name fails without `--replace`; with it, the previous agent is revoked.
+- Grant and lease signatures verify across a coordinator signing-key rotation; leases signed by an unknown key, or for another connection, are rejected.
 - Session listings show attachment state; full-screen applications redraw after attaching.
 - Sessions do not inherit the agent’s environment.
 - Expired, replayed, revoked, wrong-agent, and wrong-user grants are rejected.
@@ -213,3 +217,5 @@ Acceptance requires:
 - A clean AWS deployment can be reproduced from Terraform and documented setup inputs.
 
 Defer file transfer, remote-command automation, team sharing, Windows, browser terminals, independent peer authentication, service-manager integration (systemd user units with lingering, LaunchAgents) for crash restart and boot start, support for networks that allow only web ports (TURN over TLS on 443), exact terminal screen restoration, and high availability until after this release.
+
+Accepted v1 limitations: a client whose transport is lost for more than 60 seconds, such as a laptop sleeping, exits and the user reattaches manually. Stopping or restarting the agent from a remote session, including to upgrade it, ends the connection and leaves the machine offline until someone logs in locally and runs `agent start`.
