@@ -27,9 +27,12 @@ Provide these commands:
 | `tentaicle sessions <machine>` | List that machine’s sessions |
 | `tentaicle attach <machine> <session> [--takeover]` | Attach directly to an existing session, optionally displacing the attached client |
 | `tentaicle terminate <machine> <session>` | Explicitly terminate a remote session |
+| `tentaicle local new [--name <name>]` | Create a session on this machine’s agent and attach to it |
+| `tentaicle local sessions` | List this machine’s agent sessions |
+| `tentaicle local attach <session> [--takeover]` | Attach to a session on this machine’s agent |
 | `tentaicle agent enroll --name <name>` | Approve enrollment through a browser and register this OS account |
 | `tentaicle agent run` | Run the foreground agent |
-| `tentaicle agent start` / `stop` / `status` | Start the agent in the background, stop it, or report its state |
+| `tentaicle agent start [--inhibit-sleep]` / `stop` / `status` | Start the agent in the background, stop it, or report its state |
 | `tentaicle machine revoke <machine>` | Disable the machine’s credential and remote access |
 | `tentaicle devices` / `device revoke <id>` | List and revoke CLI credentials |
 | `tentaicle doctor` | Diagnose coordinator, authentication, and ICE connectivity |
@@ -95,7 +98,7 @@ Support configurable STUN/TURN URLs and either static TURN credentials or shared
 
 Create each session with a PTY, the account’s configured login shell, and its home directory as the starting directory. No agent-managed account switching or root execution. Users may invoke ordinary `sudo` inside the shell.
 
-Support multiple sessions per machine, with a default limit of eight. Allow one attached client per session; reject additional attachments with a clear “already attached” response that offers takeover. With `--takeover` (or confirmation in interactive `connect`), an authorized client of the same user displaces the attached client, which is told it was taken over and detached. Takeover lets a user recover a session held by a dead client without waiting for its reconnect window.
+Support multiple sessions per machine, with a default limit of eight. Sessions have an ID and an optional user-supplied name; commands accept either. Allow one attached client per session, local or remote; reject additional attachments with a clear “already attached” response that offers takeover. With `--takeover` (or confirmation in interactive `connect`), an authorized client of the same user displaces the attached client, which is told it was taken over and detached. Takeover lets a user recover a session held by a dead client without waiting for its reconnect window, or one left attached in a local terminal.
 
 Place the local terminal into raw mode while attached and always restore its state on exit or failure. Propagate window sizes and resize events. Deliver Ctrl-C through the PTY. Reserve `Ctrl-]` followed by `d` for detach, with an escaping mechanism for literal input.
 
@@ -115,13 +118,31 @@ Session termination sends a graceful termination signal, then force-kills remain
 
 Run the agent as a background process, as tmux does; install no systemd units, LaunchAgents, or system services. The user logs in once and runs `tentaicle agent start`, which re-executes the binary in a new session (`setsid`) with no controlling terminal and standard streams redirected, so it survives SSH disconnect and logout. Go cannot safely `fork` without `exec`, so use re-execution rather than a classic double fork.
 
-- Hold an exclusive lock and PID file in the user’s runtime or state directory so only one agent runs per account; `agent stop` and `agent status` use it.
+- Hold an exclusive lock and PID file in the user’s state directory so only one agent runs per account; `agent stop` and `agent status` use it.
 - Write logs to a size-bounded, rotated file in the state directory with owner-only permissions.
 - The agent does not restart after a crash and does not start at boot; the user logs in and runs `agent start` again. Previous sessions are gone, as with any agent restart.
 - On Linux, logout survival requires logind’s `KillUserProcesses=no`, the default on most distributions. `agent start` and `tentaicle doctor` read the setting from logind and warn when it is enabled.
 - On macOS, the agent survives SSH disconnect; survival of GUI logout is not promised.
 
 Build and test Linux and macOS binaries for amd64 and arm64. Provide release archives, checksums, and installation instructions.
+
+### Local attachment
+
+Users can create and attach to agent sessions on the machine itself, as with tmux, so work started locally can be resumed remotely and vice versa. A shell in an ordinary terminal window is not an agent session and cannot be attached remotely.
+
+- The agent listens on a Unix socket in its state directory (`~/.local/state/tentaicle` on Linux, `~/Library/Application Support/tentaicle` on macOS) with owner-only permissions, and recreates the socket if it is removed. Do not use `$XDG_RUNTIME_DIR` or `/tmp`: logind deletes the runtime directory when the user’s last session ends, and temporary-file cleaners remove old sockets. It verifies the connecting process’s UID with `SO_PEERCRED` on Linux and `LOCAL_PEERCRED` on macOS, and rejects other users.
+- Local clients use the same terminal frames as remote clients, without grants, leases, or the coordinator; local attachment works while the coordinator is unreachable.
+- Local and remote attachments share the session limit, the single-attachment rule, takeover, replay, and replay filtering.
+- Closing the local terminal detaches; the session keeps running.
+
+### Sleep inhibition
+
+With `agent start --inhibit-sleep` or the equivalent configuration setting, the agent prevents idle system sleep while it runs. It is off by default.
+
+- On Linux, hold a logind `sleep:idle` inhibitor lock in block mode over D-Bus, using a pure-Go client.
+- On macOS, run `caffeinate -i -w <agent pid>` as a child process, since the native power-assertion API requires cgo.
+- Inhibition does not override lid close, forced suspend, or administrator power policy.
+- `agent status` and `tentaicle doctor` report whether inhibition is active, and warn when it was requested but could not be acquired.
 
 ## Deployment, operations, and milestones
 
@@ -152,15 +173,15 @@ Document initial Google OAuth setup, allowed Google user IDs, DNS, secret provis
 
 1. **Transport proof:** Establish Go-to-Go data channels with local signaling; verify direct and forced TURN connections using the existing server.
 2. **Identity and coordination:** Implement Google approval, device credentials, enrollment, discovery, signaling, and authorization grants.
-3. **Interactive terminal:** Add PTYs, session selection, input/output, resize, detach, and exit handling.
+3. **Interactive terminal:** Add PTYs, session selection and naming, local attachment, input/output, resize, detach, and exit handling.
 4. **Recovery and access control:** Add bounded replay with query filtering, reconnect with input sequencing, takeover, backpressure, revocation leases, and process cleanup.
-5. **Distribution and AWS:** Add background agent mode, release builds, Terraform, HTTPS, backups, diagnostics, and operator documentation.
+5. **Distribution and AWS:** Add background agent mode, sleep inhibition, release builds, Terraform, HTTPS, backups, diagnostics, and operator documentation.
 
 Each milestone includes its relevant automated tests. Complete the TURN proof before building features that depend on deployment connectivity.
 
 ## Validation and acceptance
 
-Use unit tests for authorization, credential rotation, approval expiry, protocol bounds, replay offsets, replay filtering, input sequencing, DTLS fingerprint binding, and session ownership. Use integration tests with a fake identity provider, a real coordinator, two Pion peers, and a local TURN server.
+Use unit tests for authorization, credential rotation, approval expiry, protocol bounds, replay offsets, replay filtering, input sequencing, DTLS fingerprint binding, local socket peer-UID checks, and session ownership. Use integration tests with a fake identity provider, a real coordinator, two Pion peers, and a local TURN server.
 
 Acceptance requires:
 
@@ -172,6 +193,9 @@ Acceptance requires:
 - Replayed output containing terminal queries produces no input to the remote shell.
 - Output overflow, slow clients, and continuous detached output keep memory bounded.
 - Concurrent attachment is rejected consistently; takeover detaches the previous client.
+- A session created locally can be detached, attached remotely, and attached locally again, with takeover working in both directions.
+- Another local user cannot connect to the agent’s socket.
+- With sleep inhibition enabled, the machine does not idle-sleep while the agent runs on Linux and macOS; inhibition ends when the agent stops.
 - Expired, replayed, revoked, wrong-agent, and wrong-user grants are rejected.
 - A grant presented on a connection whose DTLS fingerprint does not match is rejected.
 - A Google account not on the allow-list cannot log in, enroll, or connect.
