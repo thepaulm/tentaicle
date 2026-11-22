@@ -39,7 +39,7 @@ Provide these commands:
 
 Use interactive selection when arguments are omitted in a terminal. Require explicit arguments in noninteractive use. Provide JSON output for listing commands.
 
-Configuration precedence: command flags, `TENTAICLE_*` environment variables, then a per-user configuration file. Keep credentials separate with owner-only permissions; never place them in URLs, command arguments, or logs.
+Clients and agents need only the coordinator URL; the coordinator supplies ICE and TURN settings. Configuration precedence: command flags, `TENTAICLE_*` environment variables, then a per-user configuration file. Keep credentials separate with owner-only permissions; never place them in URLs, command arguments, or logs.
 
 ### Coordinator
 
@@ -48,6 +48,8 @@ Expose versioned HTTPS JSON APIs under `/v1` and authenticated WebSocket signali
 The API supports browser approval requests, credential refresh/revocation, enrollment, machine discovery, and connection requests. WebSocket messages carry request IDs and explicit protocol versions, covering presence, session summaries, authorization grants, SDP, and ICE candidates.
 
 Use SQLite with migrations and WAL mode on persistent storage. Store users, enrolled agents and their public keys, CLI devices, hashed opaque credentials, approval requests, and access-event metadata. Identify Google users by issuer and `sub`, not email.
+
+Administrators manage the allow-list with `tentaicle-server users add <email>`, `users list`, and `users remove <user>`, run on the host through Systems Manager. An email entry matches only a Google ID token whose email is verified; on first login, the entry is bound to that account’s issuer and `sub`, and later email changes do not affect it. Removing a user revokes their CLI devices and agents.
 
 Agents maintain outbound WebSocket connections. Heartbeats run every 15 seconds; mark a machine offline after 45 seconds without contact. Publish session summaries with ID, name, creation time, and attachment state (detached, attached locally, or attached remotely), without terminal contents. Reconnecting agents replace stale presence and session inventories.
 
@@ -96,7 +98,7 @@ Keep terminal bytes as bytes; do not reinterpret their encoding. Chunk payloads 
 
 Attempt ICE connection establishment for 30 seconds, then return an actionable failure. Include an explicit relay-only diagnostic option and report whether the chosen path is direct or relayed.
 
-Support configurable STUN/TURN URLs and either static TURN credentials or shared-secret-generated expiring credentials. Require the operator to select the credential mode. Verify the existing server’s supported transports and authentication before deployment acceptance.
+Configure STUN/TURN URLs and credentials only on the coordinator. It returns the ICE server list and TURN credentials with each connection grant, to both the CLI and the agent. Support shared-secret-generated expiring credentials (default lifetime 24 hours; a relayed connection outliving them reconnects with fresh credentials) and static credentials. Require the operator to select the mode; prefer shared-secret mode, because static credentials are handed to every client. Verify the existing server’s supported transports and authentication before deployment acceptance.
 
 ## Terminal and platform behavior
 
@@ -154,7 +156,7 @@ With `agent start --inhibit-sleep` or the equivalent configuration setting, the 
 
 ### AWS deployment
 
-Use Terraform to provision one EC2 instance, encrypted persistent EBS storage, security groups, an instance role, and scheduled EBS snapshots.
+Use Terraform to provision one EC2 instance, an Elastic IP referenced by the Route 53 record, encrypted persistent EBS storage, security groups, an instance role, and scheduled EBS snapshots.
 
 Defaults:
 
@@ -164,16 +166,25 @@ Defaults:
 - Public HTTPS on port 443; port 80 only for certificate issuance and redirect.
 - Administration through AWS Systems Manager; no public SSH.
 - Caddy for TLS and reverse proxying.
-- Coordinator container pinned to a release image digest.
+- Coordinator container stored in Amazon ECR and pinned to a release image digest.
 - SQLite stored on a separately mounted data volume retained on instance termination.
 
-Terraform accepts references to runtime secrets; do not put Google or TURN secrets in Terraform variables or state. Fetch secrets through the instance role from AWS Secrets Manager.
+Terraform accepts references to runtime secrets; do not put Google, TURN, or signing secrets in Terraform variables or state. Fetch secrets through the instance role from AWS Secrets Manager.
+
+`tentaicle-server keygen` generates a grant-signing key in the format stored in Secrets Manager. Rotate it by adding the new key as “next,” waiting until agents have reconnected and fetched the key set, then promoting it to “current” and retiring the old key.
+
+### Release pipeline
+
+GitHub Actions builds, tests, and publishes each tagged release:
+
+- `tentaicle` binaries for Linux and macOS on amd64 and arm64, with checksums, published as GitHub release archives.
+- The `tentaicle-server` container image, pushed to ECR. Terraform deploys a release by its image digest.
 
 Create daily SQLite online backups and retain seven daily copies on the data volume. Snapshot the volume daily with seven-day retention. Document and test restoration onto a replacement host.
 
 Expose liveness and readiness endpoints. Emit structured logs and counters for login failures, online agents, connection attempts, relay selection, disconnects, and authorization failures. Record access events for 30 days. Never record terminal contents or credentials.
 
-Document initial Google OAuth setup, allowed Google user IDs, DNS, secret provisioning, TURN compatibility checks, upgrades, backup restoration, and device revocation. Restrict the deployment to explicitly allowed users.
+Document initial Google OAuth setup (a Web application client; an Internal consent screen when all users share a Google Workspace), allow-list management, DNS, secret provisioning, signing-key rotation, TURN compatibility checks, upgrades, backup restoration, and device revocation. Restrict the deployment to explicitly allowed users.
 
 ### Implementation sequence
 
@@ -181,7 +192,7 @@ Document initial Google OAuth setup, allowed Google user IDs, DNS, secret provis
 2. **Identity and coordination:** Implement Google approval, device credentials, enrollment, discovery, signaling, and authorization grants.
 3. **Interactive terminal:** Add PTYs, session selection and naming, local attachment, input/output, resize, detach, and exit handling.
 4. **Recovery and access control:** Add bounded replay with query filtering, reconnect with input sequencing, takeover, backpressure, revocation leases, and process cleanup.
-5. **Distribution and AWS:** Add background agent mode, sleep inhibition, release builds, Terraform, HTTPS, backups, diagnostics, and operator documentation.
+5. **Distribution and AWS:** Add background agent mode, sleep inhibition, the release pipeline, Terraform, HTTPS, backups, diagnostics, and operator documentation.
 
 Each milestone includes its relevant automated tests. Complete the TURN proof before building features that depend on deployment connectivity.
 
@@ -215,6 +226,9 @@ Acceptance requires:
 - Coordinator restart preserves enrollment; agent restart clearly invalidates previous sessions.
 - Backup restoration recovers users, enrollment, and credentials.
 - A clean AWS deployment can be reproduced from Terraform and documented setup inputs.
+- The coordinator keeps its address and DNS name across instance stop and start.
+- An allow-listed email is bound to its Google account on first login; an unverified email does not match.
+- Clients and agents connect, including through TURN, with only the coordinator URL configured.
 
 Defer file transfer, remote-command automation, team sharing, Windows, browser terminals, independent peer authentication, service-manager integration (systemd user units with lingering, LaunchAgents) for crash restart and boot start, support for networks that allow only web ports (TURN over TLS on 443), exact terminal screen restoration, and high availability until after this release.
 
