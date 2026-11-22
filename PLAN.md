@@ -47,9 +47,9 @@ Expose versioned HTTPS JSON APIs under `/v1` and authenticated WebSocket signali
 
 The API supports browser approval requests, credential refresh/revocation, enrollment, machine discovery, and connection requests. WebSocket messages carry request IDs and explicit protocol versions, covering presence, session summaries, authorization grants, SDP, and ICE candidates.
 
-Use SQLite with migrations and WAL mode on persistent storage. Store users, enrolled agents, CLI devices, hashed opaque credentials, approval requests, and access-event metadata. Identify Google users by issuer and `sub`, not email.
+Use SQLite with migrations and WAL mode on persistent storage. Store users, enrolled agents and their public keys, CLI devices, hashed opaque credentials, approval requests, and access-event metadata. Identify Google users by issuer and `sub`, not email.
 
-Agents maintain outbound WebSocket connections. Heartbeats run every 15 seconds; mark a machine offline after 45 seconds without contact. Publish session summaries without terminal contents. Reconnecting agents replace stale presence and session inventories.
+Agents maintain outbound WebSocket connections. Heartbeats run every 15 seconds; mark a machine offline after 45 seconds without contact. Publish session summaries with ID, name, creation time, and attachment state (detached, attached locally, or attached remotely), without terminal contents. Reconnecting agents replace stale presence and session inventories.
 
 The coordinator is a single instance for v1. Coordinator restarts preserve enrollment and credentials; agents reconnect with capped exponential backoff and jitter.
 
@@ -59,13 +59,15 @@ Implement an application-owned browser approval flow:
 
 1. CLI or agent requests a short-lived approval transaction and receives a secret polling token plus a human-readable code.
 2. The user opens the coordinator’s approval page on any browser, signs in with Google, and explicitly approves the displayed client or machine.
-3. The requesting process polls using its secret and receives a dedicated revocable credential.
+3. The requesting process polls using its secret. A CLI receives a dedicated revocable credential; an agent’s public key, submitted with its approval request, becomes registered.
 
 Use Google’s server-side authorization-code flow with exact registered HTTPS callbacks, state, nonce, secure browser sessions, and validated ID tokens. Request only identity scopes. This approval mechanism is our own; do not assume Google supports device authorization for this use case.
 
 Approval codes expire after 10 minutes and are single-use. Rate-limit creation, code entry, and polling. Browser approval must require an explicit action protected against CSRF.
 
-Issue short-lived access tokens and rotating opaque refresh credentials. Store refresh credentials hashed on the server. Reuse of a rotated refresh credential revokes that device’s credential family.
+CLI devices receive short-lived access tokens and rotating opaque refresh credentials. Store refresh credentials hashed on the server. Reuse of a rotated refresh credential revokes that device’s credential family, except that the immediately previous credential is accepted once within 60 seconds of rotation if its replacement has not been used, so a lost refresh response does not revoke the device.
+
+Agents do not use refresh credentials. At enrollment, the agent generates an Ed25519 key pair, keeps the private key in its state directory with owner-only permissions, and registers the public key. The agent authenticates each WebSocket connection and access-token request by signing a coordinator-issued nonce. Agent credentials do not expire from inactivity; they end only by revocation. This keeps an unattended agent from stranding itself through a failed rotation.
 
 Each agent belongs to one user and one local OS account. Agents can publish their own state and accept authorized connections; they cannot enumerate or control other machines.
 
@@ -73,7 +75,7 @@ For every connection, issue a signed, single-use grant bound to the user, CLI de
 
 Trust the coordinator as the authorization authority: access depends on Google sign-in by an allowed user and a valid coordinator credential. WebRTC encryption and authenticated signaling protect connections. A compromised coordinator could grant itself access; independent peer-key pinning is outside v1.
 
-Push revocation to connected agents immediately. Renew active connection authorization every 30 seconds with a 90-second lease. If renewal fails, detach remote clients at lease expiry while retaining local shells. Revoking an enrolled agent also prevents further enrollment-credential use.
+Push revocation to connected agents immediately. Renew active connection authorization every 30 seconds with a 90-second lease. If renewal fails, detach remote clients at lease expiry while retaining local shells. Revoking an enrolled agent disables its registered key.
 
 ### Transport
 
@@ -96,23 +98,25 @@ Support configurable STUN/TURN URLs and either static TURN credentials or shared
 
 ## Terminal and platform behavior
 
-Create each session with a PTY, the account’s configured login shell, and its home directory as the starting directory. No agent-managed account switching or root execution. Users may invoke ordinary `sudo` inside the shell.
+Create each session with a PTY, the account’s configured login shell, and its home directory as the starting directory.
 
-Support multiple sessions per machine, with a default limit of eight. Sessions have an ID and an optional user-supplied name; commands accept either. Allow one attached client per session, local or remote; reject additional attachments with a clear “already attached” response that offers takeover. With `--takeover` (or confirmation in interactive `connect`), an authorized client of the same user displaces the attached client, which is told it was taken over and detached. Takeover lets a user recover a session held by a dead client without waiting for its reconnect window, or one left attached in a local terminal.
+Start sessions from a minimal environment: `HOME`, `USER`, `LOGNAME`, `SHELL`, a default `PATH`, and `TERM` and locale variables supplied by the creating client; the login shell’s profile provides the rest. Do not inherit the agent’s environment, so values such as `SSH_AUTH_SOCK`, `DISPLAY`, and `DBUS_SESSION_BUS_ADDRESS` from wherever the agent was started do not leak into sessions. Set `TENTAICLE_SESSION` to the session ID so the CLI warns before nesting sessions. Document that a session keeps the `TERM` it was created with; attaching from a different terminal type may render imperfectly. No agent-managed account switching or root execution. Users may invoke ordinary `sudo` inside the shell.
 
-Place the local terminal into raw mode while attached and always restore its state on exit or failure. Propagate window sizes and resize events. Deliver Ctrl-C through the PTY. Reserve `Ctrl-]` followed by `d` for detach, with an escaping mechanism for literal input.
+Support multiple sessions per machine, with a default limit of eight. Sessions have an ID and an optional user-supplied name; commands accept either. Allow one attached client per session, local or remote; reject additional attachments with a clear “already attached” response that offers takeover. With `--takeover` (or confirmation in interactive `connect`, which shows each session’s attachment state), an authorized client of the same user displaces the attached client, which is told it was taken over and detached. Takeover lets a user recover a session held by a dead client without waiting for its reconnect window, or one left attached in a local terminal.
+
+Place the local terminal into raw mode while attached and always restore its state on exit or failure. Propagate window sizes and resize events. Deliver Ctrl-C through the PTY. Reserve `Ctrl-]` followed by `d` for detach and `r` for redraw, with an escaping mechanism for literal input.
 
 Keep disconnected shells running until explicit termination, shell exit, or agent shutdown. Disable automatic idle expiry by default.
 
 Maintain a 1 MiB in-memory output ring per session with monotonic byte offsets:
 
-- On transport loss, attempt reconnection for up to 60 seconds.
+- On transport loss, attempt reconnection for up to 60 seconds. The agent releases a remote attachment after the same window.
 - A reconnecting client requests output after its last received offset.
 - A new attachment receives the retained output.
 - Report truncation visibly when older output has been discarded.
 - Input frames carry per-attachment sequence numbers; the agent acknowledges the last sequence written to the PTY. On reconnect, the agent reports its last applied sequence and the client resends only later frames, so input is neither duplicated nor lost. Bound unacknowledged input to 64 KiB and stop reading local input, other than the detach escape, while reconnecting.
 - When replaying retained output, the client strips sequences that make the local terminal reply or act, such as status and cursor-position reports, device-attribute queries, color and setting queries, window reports, and OSC 52 clipboard writes. The filter handles sequences split across chunks. Live output is not filtered.
-- Full-screen applications may require a redraw; exact screen reconstruction is outside v1.
+- After every attachment, and on redraw, the agent briefly changes the PTY size and restores it, because the kernel signals only actual size changes. This prompts full-screen applications to redraw. Exact screen reconstruction is outside v1.
 
 Session termination sends a graceful termination signal, then force-kills remaining session processes after five seconds. Agent shutdown terminates its sessions and reaps children. Retain exited-session metadata and buffered output for ten minutes so reconnecting clients can observe exit status.
 
@@ -139,8 +143,8 @@ Users can create and attach to agent sessions on the machine itself, as with tmu
 
 With `agent start --inhibit-sleep` or the equivalent configuration setting, the agent prevents idle system sleep while it runs. It is off by default.
 
-- On Linux, hold a logind `sleep:idle` inhibitor lock in block mode over D-Bus, using a pure-Go client.
-- On macOS, run `caffeinate -i -w <agent pid>` as a child process, since the native power-assertion API requires cgo.
+- On Linux, hold a logind `sleep` inhibitor lock in block mode over D-Bus, using a pure-Go client. Do not inhibit `idle`: some desktops treat that as user activity and never lock the screen.
+- On macOS, run `caffeinate -i -w <agent pid>` as a child process, since the native power-assertion API requires cgo. This permits display sleep and screen locking.
 - Inhibition does not override lid close, forced suspend, or administrator power policy.
 - `agent status` and `tentaicle doctor` report whether inhibition is active, and warn when it was requested but could not be acquired.
 
@@ -181,7 +185,7 @@ Each milestone includes its relevant automated tests. Complete the TURN proof be
 
 ## Validation and acceptance
 
-Use unit tests for authorization, credential rotation, approval expiry, protocol bounds, replay offsets, replay filtering, input sequencing, DTLS fingerprint binding, local socket peer-UID checks, and session ownership. Use integration tests with a fake identity provider, a real coordinator, two Pion peers, and a local TURN server.
+Use unit tests for authorization, credential rotation, approval expiry, protocol bounds, replay offsets, replay filtering, input sequencing, DTLS fingerprint binding, local socket peer-UID checks, agent key authentication, the refresh grace window, session environment construction, and session ownership. Use integration tests with a fake identity provider, a real coordinator, two Pion peers, and a local TURN server.
 
 Acceptance requires:
 
@@ -195,7 +199,10 @@ Acceptance requires:
 - Concurrent attachment is rejected consistently; takeover detaches the previous client.
 - A session created locally can be detached, attached remotely, and attached locally again, with takeover working in both directions.
 - Another local user cannot connect to the agent’s socket.
-- With sleep inhibition enabled, the machine does not idle-sleep while the agent runs on Linux and macOS; inhibition ends when the agent stops.
+- With sleep inhibition enabled, the machine does not idle-sleep while the agent runs on Linux and macOS, the screen still locks on its idle timer, and inhibition ends when the agent stops.
+- A lost refresh response does not revoke a CLI device; an agent stays enrolled across coordinator and network outages of any length.
+- Session listings show attachment state; full-screen applications redraw after attaching.
+- Sessions do not inherit the agent’s environment.
 - Expired, replayed, revoked, wrong-agent, and wrong-user grants are rejected.
 - A grant presented on a connection whose DTLS fingerprint does not match is rejected.
 - A Google account not on the allow-list cannot log in, enroll, or connect.
